@@ -21,6 +21,7 @@ use rustls_pki_types::ServerName;
 use tokio_rustls::TlsConnector;
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+static GLOBAL_PROXY_VERSION: AtomicU64 = AtomicU64::new(1);
 
 fn next_generation() -> u64 {
     NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
@@ -74,6 +75,7 @@ pub fn set_global_proxy_config(settings: Option<ProxyConfig>) {
     };
     lock.proxy = settings;
     lock.client = None;
+    GLOBAL_PROXY_VERSION.fetch_add(1, Ordering::Release);
 }
 
 pub fn get_global_proxy_config() -> Option<ProxyConfig> {
@@ -89,6 +91,7 @@ pub fn reset_shared_http_client() {
         Err(poisoned) => poisoned.into_inner(),
     };
     lock.client = None;
+    GLOBAL_PROXY_VERSION.fetch_add(1, Ordering::Release);
 }
 
 pub fn http_client_builder_for(proxy_cfg: Option<&ProxyConfig>) -> reqwest::ClientBuilder {
@@ -194,6 +197,8 @@ struct ClientState {
     custom_http_user_agent: Option<String>,
     proxy: Option<ProxyConfig>,
     http_client: Option<reqwest::Client>,
+    http_client_generation: u64,
+    http_client_proxy_version: u64,
     is_vpn: Option<bool>,
 }
 
@@ -241,6 +246,8 @@ impl MaxClient {
                 custom_http_user_agent: None,
                 proxy: None,
                 http_client: None,
+                http_client_generation: 0,
+                http_client_proxy_version: 0,
                 is_vpn: None,
             })),
             event_tx,
@@ -251,6 +258,7 @@ impl MaxClient {
         let mut state = self.state.lock().await;
         state.proxy = proxy;
         state.http_client = None;
+        state.http_client_generation = state.http_client_generation.wrapping_add(1);
     }
 
     pub async fn get_proxy(&self) -> Option<ProxyConfig> {
@@ -271,12 +279,27 @@ impl MaxClient {
     }
 
     pub async fn http_client(&self) -> reqwest::Client {
-        if let Some(ref client) = self.state.lock().await.http_client {
-            return client.clone();
-        }
+        let global_ver = GLOBAL_PROXY_VERSION.load(Ordering::Acquire);
+        let start_gen = {
+            let state = self.state.lock().await;
+            let global_ok = state.proxy.is_some() || state.http_client_proxy_version == global_ver;
+            if global_ok {
+                if let Some(ref client) = state.http_client {
+                    return client.clone();
+                }
+            }
+            state.http_client_generation
+        };
+
         let client = self.create_http_client().await;
         let mut state = self.state.lock().await;
-        state.http_client = Some(client.clone());
+        let current_global_ver = GLOBAL_PROXY_VERSION.load(Ordering::Acquire);
+        if state.http_client_generation == start_gen
+            && (state.proxy.is_some() || current_global_ver == global_ver)
+        {
+            state.http_client = Some(client.clone());
+            state.http_client_proxy_version = global_ver;
+        }
         client
     }
 
@@ -337,6 +360,7 @@ impl MaxClient {
         let mut state = self.state.lock().await;
         state.custom_http_user_agent = ua;
         state.http_client = None;
+        state.http_client_generation = state.http_client_generation.wrapping_add(1);
         Ok(())
     }
 
@@ -350,6 +374,7 @@ impl MaxClient {
             identity.user_agent = ua;
         }
         state.http_client = None;
+        state.http_client_generation = state.http_client_generation.wrapping_add(1);
     }
 
     pub async fn get_user_agent(&self) -> Option<UserAgent> {
@@ -361,7 +386,11 @@ impl MaxClient {
         if let Some(custom) = &state.custom_http_user_agent {
             return custom.clone();
         }
-        if state.is_mobile {
+        let is_web_identity = state
+            .identity
+            .as_ref()
+            .is_some_and(|id| id.user_agent.device_type.eq_ignore_ascii_case("web"));
+        if state.is_mobile && !is_web_identity {
             if let Some(ref id) = state.identity {
                 return id.user_agent.to_http_user_agent();
             }
@@ -436,7 +465,6 @@ impl MaxClient {
                 let is_ws = ws_url.scheme() == "ws";
 
                 let tcp = transport::proxy::open_proxied_stream(proxy.as_ref(), &host, port).await?;
-                tcp.set_nodelay(true).ok();
 
                 let ws = if is_ws {
                     WebSocket::handshake_with_request(ws_url, tcp, ws_options, req_builder)
@@ -488,6 +516,7 @@ impl MaxClient {
             state_lock.identity = Some(identity.clone());
             state_lock.is_mobile = is_mobile;
             state_lock.http_client = None;
+            state_lock.http_client_generation = state_lock.http_client_generation.wrapping_add(1);
             state_lock.seq = 0;
             state_lock.is_closed = false;
             state_lock.is_vpn = None;
@@ -501,7 +530,7 @@ impl MaxClient {
 
             let old_pending = std::mem::replace(&mut state_lock.pending, Arc::new(Mutex::new(HashMap::new())));
             {
-                let mut guard = old_pending.lock().unwrap();
+                let mut guard = old_pending.lock().unwrap_or_else(|e| e.into_inner());
                 for (_, sender) in guard.drain() {
                     let _ = sender.send(Err(Error::ConnectionClosed("Соединение заменено новым".to_string())));
                 }
@@ -543,14 +572,7 @@ impl MaxClient {
         let handshake_response = match self.send_and_wait_with_generation(6, handshake_payload, 0, Some(generation)).await {
             Ok(resp) => resp,
             Err(e) => {
-                let mut state = self.state.lock().await;
-                if state.generation == generation {
-                    state.is_closed = true;
-                    if let Some(shutdown_tx) = state.shutdown_tx.take() {
-                        let _ = shutdown_tx.send(());
-                    }
-                    state.writer = None;
-                }
+                self.invalidate_connection(generation, &e.to_string()).await;
                 return Err(e);
             }
         };
@@ -589,7 +611,7 @@ impl MaxClient {
 
         let old_pending = std::mem::replace(&mut state.pending, Arc::new(Mutex::new(HashMap::new())));
         {
-            let mut pending_guard = old_pending.lock().unwrap();
+            let mut pending_guard = old_pending.lock().unwrap_or_else(|e| e.into_inner());
             for (_, sender) in pending_guard.drain() {
                 let _ = sender.send(Err(Error::ConnectionClosed("Соединение закрыто".to_string())));
             }
@@ -628,7 +650,7 @@ impl MaxClient {
     async fn invalidate_connection(&self, generation: u64, reason: &str) {
         let mut s = self.state.lock().await;
         if Self::close_generation_state(&mut s, &self.event_tx, generation) {
-            let mut pending_guard = s.pending.lock().unwrap();
+            let mut pending_guard = s.pending.lock().unwrap_or_else(|e| e.into_inner());
             for (_, sender) in pending_guard.drain() {
                 let _ = sender.send(Err(Error::ConnectionClosed(reason.to_string())));
             }
@@ -726,7 +748,7 @@ impl MaxClient {
             let generation = state.generation;
             let pending_arc = Arc::clone(&state.pending);
             
-            pending_arc.lock().unwrap().insert(current_seq, tx);
+            pending_arc.lock().unwrap_or_else(|e| e.into_inner()).insert(current_seq, tx);
 
             (Request {
                 ver: 10,
@@ -743,15 +765,18 @@ impl MaxClient {
             "request": request
         })); 
 
+        let deadline = tokio::time::Instant::now() + Constants::DEFAULT_TIMEOUT;
+
         match self.send_frame(request.clone(), generation).await {
             Ok(()) => {},
             Err(e) => {
-                pending_arc.lock().unwrap().remove(&request.seq);
+                pending_arc.lock().unwrap_or_else(|p| p.into_inner()).remove(&request.seq);
                 return Err(e);
             }
         }
         
-        match timeout(Constants::DEFAULT_TIMEOUT, rx).await {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        match timeout(remaining, rx).await {
             Ok(Ok(Ok(response))) => {
                 trace!("Получен ответ для seq: {}", response.seq);
                 if response.payload.get("error").is_some() {
@@ -767,7 +792,7 @@ impl MaxClient {
             }
             Err(_) => {
                 warn!("Таймаут запроса для seq: {}", request.seq);
-                pending_arc.lock().unwrap().remove(&request.seq);
+                pending_arc.lock().unwrap_or_else(|p| p.into_inner()).remove(&request.seq);
                 Err(Error::RequestTimeout(Constants::DEFAULT_TIMEOUT))
             }
         }
@@ -788,7 +813,7 @@ impl MaxClient {
                         Ok(Some(resp)) => {
                             let seq = resp.seq;
                             let waiting_sender = {
-                                let mut guard = pending.lock().unwrap();
+                                let mut guard = pending.lock().unwrap_or_else(|e| e.into_inner());
                                 guard.remove(&seq)
                             };
                             
@@ -816,7 +841,7 @@ impl MaxClient {
                                 let mut s = state.lock().await;
                                 Self::close_generation_state(&mut s, &event_sender, generation);
                             }
-                            let mut pending_guard = pending.lock().unwrap();
+                            let mut pending_guard = pending.lock().unwrap_or_else(|e| e.into_inner());
                             for (_, sender) in pending_guard.drain() {
                                 let _ = sender.send(Err(Error::ConnectionClosed("Соединение закрыто".to_string())));
                             }
@@ -828,7 +853,7 @@ impl MaxClient {
                                 let mut s = state.lock().await;
                                 Self::close_generation_state(&mut s, &event_sender, generation);
                             }
-                            let mut pending_guard = pending.lock().unwrap();
+                            let mut pending_guard = pending.lock().unwrap_or_else(|e| e.into_inner());
                             for (_, sender) in pending_guard.drain() {
                                 let _ = sender.send(Err(Error::ConnectionClosed(e.to_string()))); 
                             }
@@ -837,7 +862,7 @@ impl MaxClient {
                     }
                 }
                 _ = shutdown_rx.recv() => {
-                    let mut pending_guard = pending.lock().unwrap();
+                    let mut pending_guard = pending.lock().unwrap_or_else(|e| e.into_inner());
                     for (_, sender) in pending_guard.drain() {
                         let _ = sender.send(Err(Error::ConnectionClosed("Соединение закрыто".to_string())));
                     }

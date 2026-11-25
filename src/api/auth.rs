@@ -567,7 +567,7 @@ impl MaxClient {
                 "QR: 2FA password required; call check_password with challenge trackId: {:?}",
                 challenge.get("trackId")
             );
-            return Err(Error::ApiResponse(resp.payload));
+            return Err(Error::PasswordRequired(resp.payload));
         }
 
         warn!("QR: no login token in LOGIN_BY_QR response");

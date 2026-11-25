@@ -124,12 +124,6 @@ impl ProxyConfig {
             if p_trimmed == "*" {
                 return true;
             }
-            if p_trimmed.contains(',') {
-                if target == p_trimmed.to_lowercase() {
-                    return true;
-                }
-                continue;
-            }
             let Some(p_final) = normalize_bypass_pattern(p_trimmed) else {
                 continue;
             };
@@ -395,6 +389,13 @@ async fn connect_http_connect(
                 "HTTP proxy error: {}",
                 first_line
             )));
+        }
+
+        if response_buf.len() > end_pos + 4 {
+            log::warn!(
+                "HTTP proxy sent {} unexpected trailing bytes after CONNECT response",
+                response_buf.len() - (end_pos + 4)
+            );
         }
 
         break;

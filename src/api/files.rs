@@ -249,10 +249,24 @@ impl MaxClient {
 
         let client = self.http_client().await;
 
+        let sanitized_name: String = file_name
+            .chars()
+            .filter(|&c| c != '\r' && c != '\n')
+            .map(|c| match c {
+                '"' | '\\' => '_',
+                _ => c,
+            })
+            .collect();
+        let safe_filename = if sanitized_name.is_empty() {
+            "file".to_string()
+        } else {
+            sanitized_name
+        };
+
         let response = match client
             .post(upload_url)
             .header("Content-Type", "application/octet-stream")
-            .header("Content-Disposition", format!("attachment; filename=\"{}\"", file_name))
+            .header("Content-Disposition", format!("attachment; filename=\"{}\"", safe_filename))
             .header("Content-Length", file_size.to_string())
             .header("Content-Range", format!("bytes 0-{}/{}", file_size.saturating_sub(1), file_size))
             .header("Connection", "keep-alive")
